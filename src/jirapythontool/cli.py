@@ -17,21 +17,18 @@ import requests
 # -----------------------------
 # Defaults (override via env or CLI)
 # -----------------------------
-DEFAULT_BASE_URL = os.getenv("JIRA_BASE_URL", "")
+DEFAULT_BASE_URL = os.getenv("JIRA_BASE_URL", "") # e.g., https://yourdomain.atlassian.net
 DEFAULT_EMAIL = os.getenv("JIRA_EMAIL", "")  # Jira Cloud: account email
-DEFAULT_TOKEN = os.getenv("JIRA_API_TOKEN", "")  # <-- keep token out of code
+DEFAULT_TOKEN = os.getenv("JIRA_API_TOKEN", "")  # Jira Cloud: API token
 
-API_ROOT = "/rest/api/latest"  # IMPORTANT for your org
+API_ROOT = "/rest/api/latest"  
 
 
 # -----------------------------
 # Utilities
 # -----------------------------
 def iso_from_jira_dt(dt_str: str) -> str:
-    """
-    Jira often returns: 2025-12-30T12:34:56.789-0500
-    Convert to ISO; if parsing fails, return raw.
-    """
+   
     if not dt_str:
         return ""
     for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
