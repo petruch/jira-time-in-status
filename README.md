@@ -72,6 +72,58 @@ python3 src/jirapythontool/cli.py \
   --time-unit days \
   --out XXX.csv
 
+Optional status selection and ordering
+You can control which status columns appear in the CSV and the order they appear in.
+If --statuses is not provided, the script will automatically include all discovered statuses.
+
+
+Examples:
+python3 cli.py \
+  --jql 'project = "Product Solution Design" AND issuetype in (Story, Bug)' \
+  --statuses "To Do" "In Progress" "Blocked" "Review" "UAT" "Ready To Deploy" \
+  --out XXXX.csv
+
+  
+Or comma-separated:
+python3 cli.py \
+  --jql 'project = "Product Solution Design" AND issuetype in (Story, Bug)' \
+  --statuses "To Do,In Progress,Blocked,Review,UAT,Ready To Deploy" \
+  --out XXXX.csv
+
+  
+Optional extra output fields
+You can include additional Jira fields in the CSV before the status columns by using --extra-fields.
+
+Use the format:
+--extra-fields "Column Label=field_name"
+
+
+Examples:
+
+python3 cli.py \
+  --jql 'project = "Product Solution Design" AND issuetype in (Story, Bug)' \
+  --extra-fields "Priority=priority" \
+  --out XXXX.csv
+  
+Custom field example:
+
+python3 cli.py \
+  --jql 'project = "Product Solution Design" AND issuetype in (Story, Bug)' \
+  --extra-fields "Story Points=customfield_10026" "Priority=priority" \
+  --out XXXX.csv
+  
+Combined example
+
+python3 cli.py \
+  --jql 'project = "Product Solution Design" AND issuetype in (Story, Bug) AND status = "Done"' \
+  --time-unit days \
+  --statuses "To Do,In Progress,Blocked,Review,UAT,Ready To Deploy" \
+  --extra-fields "Story Points=customfield_10026" "Priority=priority" \
+  --out XXXX.csv
+  
+Notes:
+
+--statuses only controls which status columns are shown in
 
 ## Output
 
