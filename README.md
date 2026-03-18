@@ -57,20 +57,20 @@ python3 src/jirapythontool/cli.py -h
 Basic example:
 
 python3 src/jirapythontool/cli.py \
-  --project PSD \
+  --project XXX \
   --issue-type Story \
   --since-days 100 \
   --time-unit hours \
-  --out PSD.csv
+  --out XXX.csv
 
 
 Custom JQL example:
 
 
 python3 src/jirapythontool/cli.py \
-  --jql 'project = "Product Solution Design" AND issuetype in (Story, Bug) AND status = "Done"' \
+  --jql 'project = "XXX" AND issuetype in (Story, Bug) AND status = "Done"' \
   --time-unit days \
-  --out PSD.csv
+  --out XXX.csv
 
 
 ## Output
@@ -81,7 +81,7 @@ Example:
 
 
 issue_key,summary,assignee,To Do,In Progress,Blocked,Done
-PSD-101,Create validation rule,Jane Doe,1.20,3.50,0.75,2.10
+XXX-101,Create validation rule,Jane Doe,1.20,3.50,0.75,2.10
 
 
 ## How It Works
