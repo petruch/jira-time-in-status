@@ -1,4 +1,4 @@
-# Jira Python Status Time Tool
+# Jira Status Calculation Tool
 
 A lightweight Python CLI for Jira Cloud that pulls issue changelogs and calculates time spent in each workflow status, helping identify bottlenecks and delivery delays.
 
