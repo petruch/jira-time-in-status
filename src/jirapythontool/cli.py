@@ -84,6 +84,103 @@ def ensure_since_in_jql(jql: str, since_days: int, since_field: str) -> str:
     return f"({jql.strip()}) AND {clause}"
 
 
+def parse_statuses_arg(statuses_arg: Optional[List[str]]) -> Optional[List[str]]:
+    """
+    Accept either:
+      --statuses "To Do,In Progress,Done"
+    or
+      --statuses "To Do" "In Progress" "Done"
+
+    Returns a cleaned ordered list, or None if not provided.
+    """
+    if not statuses_arg:
+        return None
+
+    parsed: List[str] = []
+    for item in statuses_arg:
+        if item is None:
+            continue
+        parts = [p.strip() for p in item.split(",")]
+        parsed.extend([p for p in parts if p])
+
+    seen = set()
+    unique: List[str] = []
+    for status in parsed:
+        key = status.casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(status)
+
+    return unique if unique else None
+
+
+def parse_extra_fields_arg(extra_fields_arg: Optional[List[str]]) -> List[Tuple[str, str]]:
+    """
+    Accepts:
+      --extra-fields "Story Points=customfield_10016" "Priority=priority"
+    or
+      --extra-fields "Story Points=customfield_10016,Priority=priority"
+
+    Returns:
+      [("Story Points", "customfield_10016"), ("Priority", "priority")]
+    """
+    if not extra_fields_arg:
+        return []
+
+    parsed_items: List[str] = []
+    for item in extra_fields_arg:
+        if item is None:
+            continue
+        parts = [p.strip() for p in item.split(",")]
+        parsed_items.extend([p for p in parts if p])
+
+    results: List[Tuple[str, str]] = []
+    seen = set()
+
+    for item in parsed_items:
+        if "=" in item:
+            label, field_name = item.split("=", 1)
+            label = label.strip()
+            field_name = field_name.strip()
+        else:
+            label = item.strip()
+            field_name = item.strip()
+
+        if not label or not field_name:
+            continue
+
+        key = field_name.casefold()
+        if key not in seen:
+            seen.add(key)
+            results.append((label, field_name))
+
+    return results
+
+
+def extract_field_value(value: Any) -> str:
+    """
+    Best-effort formatting for common Jira field value shapes.
+    """
+    if value is None:
+        return ""
+
+    if isinstance(value, (str, int, float, bool)):
+        return str(value)
+
+    if isinstance(value, list):
+        parts = [extract_field_value(v) for v in value]
+        return ", ".join([p for p in parts if p])
+
+    if isinstance(value, dict):
+        for key in ("displayName", "name", "value", "key", "emailAddress"):
+            v = value.get(key)
+            if v is not None:
+                return str(v)
+        return str(value)
+
+    return str(value)
+
+
 # -----------------------------
 # Keychain
 # -----------------------------
@@ -244,9 +341,6 @@ def fetch_full_changelog(
 
 
 def extract_status_transitions(changelog_values: List[Dict[str, Any]]) -> List[Tuple[str, str, datetime]]:
-    """
-    Returns a list of: (from_status, to_status, changed_at)
-    """
     transitions: List[Tuple[str, str, datetime]] = []
 
     sorted_hist = sorted(changelog_values, key=lambda h: h.get("created") or "")
@@ -272,7 +366,7 @@ def calculate_time_in_status(
     changelog_values: List[Dict[str, Any]],
     now_dt: datetime,
 ) -> Dict[str, float]:
- 
+
     durations: Dict[str, float] = {}
 
     created_dt = parse_jira_dt(issue_created)
@@ -281,14 +375,11 @@ def calculate_time_in_status(
 
     transitions = extract_status_transitions(changelog_values)
 
-    # No status changes: everything from creation until now belongs to current status
     if not transitions:
         seconds = max((now_dt - created_dt).total_seconds(), 0.0)
         durations[current_status] = durations.get(current_status, 0.0) + seconds
         return durations
 
-    # Initial status is the "from" of the first status transition if present,
-    # otherwise fall back to current status.
     first_from = transitions[0][0].strip() if transitions[0][0] else current_status
     prev_status = first_from
     prev_time = created_dt
@@ -300,7 +391,6 @@ def calculate_time_in_status(
         prev_status = to_status or prev_status
         prev_time = changed_at
 
-    # Final open interval: last transitioned status -> now
     seconds = max((now_dt - prev_time).total_seconds(), 0.0)
     durations[prev_status] = durations.get(prev_status, 0.0) + seconds
 
@@ -314,6 +404,8 @@ def build_matrix(
     issues: List[Dict[str, Any]],
     per_issue_durations: Dict[str, Dict[str, float]],
     unit: str,
+    selected_statuses: Optional[List[str]] = None,
+    extra_fields: Optional[List[Tuple[str, str]]] = None,
 ) -> Tuple[List[str], List[List[str]]]:
     statuses_set = set()
 
@@ -323,9 +415,22 @@ def build_matrix(
     def natural_key(s: str):
         return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s or "")]
 
-    all_statuses = sorted(statuses_set, key=natural_key)
+    discovered_statuses = sorted(statuses_set, key=natural_key)
 
-    headers = ["issue_key", "summary", "assignee"] + all_statuses
+    if selected_statuses:
+        discovered_lookup = {s.casefold(): s for s in discovered_statuses}
+        all_statuses: List[str] = []
+
+        for requested in selected_statuses:
+            matched = discovered_lookup.get(requested.casefold())
+            all_statuses.append(matched if matched else requested)
+    else:
+        all_statuses = discovered_statuses
+
+    extra_fields = extra_fields or []
+    extra_labels = [label for label, _ in extra_fields]
+
+    headers = ["issue_key", "summary", "assignee"] + extra_labels + all_statuses
     rows: List[List[str]] = []
 
     for issue in issues:
@@ -338,9 +443,15 @@ def build_matrix(
         if isinstance(assignee_obj, dict):
             assignee = (assignee_obj.get("displayName") or assignee_obj.get("emailAddress") or "").strip()
 
+        extra_values = []
+        for _, field_name in extra_fields:
+            extra_values.append(extract_field_value(fields.get(field_name)))
+
         duration_map = per_issue_durations.get(key, {})
-        row = [key, summary, assignee] + [
-            format_duration(duration_map.get(status, 0.0), unit) for status in all_statuses
+        duration_lookup = {k.casefold(): v for k, v in duration_map.items()}
+
+        row = [key, summary, assignee] + extra_values + [
+            format_duration(duration_lookup.get(status.casefold(), 0.0), unit) for status in all_statuses
         ]
         rows.append(row)
 
@@ -372,7 +483,34 @@ def main() -> int:
     p.add_argument("--changelog-page-size", type=int, default=100)
     p.add_argument("--time-unit", choices=["seconds", "minutes", "hours", "days"], default="hours")
 
+    p.add_argument(
+        "--statuses",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional list of statuses to include and order in the output. "
+            'Examples: --statuses "To Do,In Progress,Done" '
+            'or --statuses "To Do" "In Progress" "Done". '
+            "If omitted, all discovered statuses are included."
+        ),
+    )
+
+    p.add_argument(
+        "--extra-fields",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional Jira fields to include before status columns. "
+            'Use label=fieldName, e.g. --extra-fields "Story Points=customfield_10016" '
+            '"Priority=priority". '
+            "If label is omitted, the field name is used as the column header."
+        ),
+    )
+
     args = p.parse_args()
+
+    selected_statuses = parse_statuses_arg(args.statuses)
+    extra_fields = parse_extra_fields_arg(args.extra_fields)
 
     if not args.base_url:
         args.base_url = keychain_get("jira_base_url")
@@ -392,11 +530,16 @@ def main() -> int:
 
     limit = args.limit if args.limit and args.limit > 0 else None
 
+    search_fields = ["summary", "assignee", "created", "status"]
+    for _, field_name in extra_fields:
+        if field_name not in search_fields:
+            search_fields.append(field_name)
+
     issues = search_issues(
         session=session,
         base_url=args.base_url,
         jql=full_jql,
-        fields=["summary", "assignee", "created", "status"],
+        fields=search_fields,
         max_results=args.search_page_size,
         limit=limit,
     )
@@ -442,6 +585,8 @@ def main() -> int:
         issues=issues,
         per_issue_durations=per_issue_durations,
         unit=args.time_unit,
+        selected_statuses=selected_statuses,
+        extra_fields=extra_fields,
     )
 
     with open(args.out, "w", newline="", encoding="utf-8") as f:
@@ -452,6 +597,16 @@ def main() -> int:
     print(f"Done. Wrote {len(rows)} rows to {args.out}")
     print(f"JQL used: {full_jql}")
     print(f"Time unit: {args.time_unit}")
+    if selected_statuses:
+        print(f"Statuses selected: {selected_statuses}")
+    else:
+        print("Statuses selected: all discovered statuses")
+
+    if extra_fields:
+        print(f"Extra fields selected: {[label for label, _ in extra_fields]}")
+    else:
+        print("Extra fields selected: none")
+
     return 0
 
 
