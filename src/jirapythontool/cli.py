@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-from dataclasses import fields
 import os
 import random
 import re
 import csv
 import argparse
-from datetime import datetime
+import subprocess
+from datetime import datetime, timezone
 
 import time as tm
-from time import time as now
-
 from typing import Any, Dict, List, Optional, Tuple
 import requests
 
@@ -17,33 +15,46 @@ import requests
 # -----------------------------
 # Defaults (override via env or CLI)
 # -----------------------------
-DEFAULT_BASE_URL = os.getenv("JIRA_BASE_URL", "") # e.g., https://yourdomain.atlassian.net
-DEFAULT_EMAIL = os.getenv("JIRA_EMAIL", "")  # Jira Cloud: account email
-DEFAULT_TOKEN = os.getenv("JIRA_API_TOKEN", "")  # Jira Cloud: API token
+DEFAULT_BASE_URL = os.getenv("JIRA_BASE_URL", "")
+DEFAULT_EMAIL = os.getenv("JIRA_EMAIL", "")
+DEFAULT_TOKEN = os.getenv("JIRA_API_TOKEN", "")
 
-API_ROOT = "/rest/api/latest"  
+API_ROOT = "/rest/api/latest"
 
 
 # -----------------------------
 # Utilities
 # -----------------------------
-def iso_from_jira_dt(dt_str: str) -> str:
-   
+def parse_jira_dt(dt_str: str) -> Optional[datetime]:
     if not dt_str:
-        return ""
+        return None
+
     for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
         try:
-            return datetime.strptime(dt_str, fmt).isoformat()
+            return datetime.strptime(dt_str, fmt)
         except Exception:
             continue
-    return dt_str
+    return None
+
+
+def iso_from_jira_dt(dt_str: str) -> str:
+    dt = parse_jira_dt(dt_str)
+    return dt.isoformat() if dt else dt_str
+
+
+def format_duration(seconds: float, unit: str) -> str:
+    if unit == "seconds":
+        return str(int(seconds))
+    if unit == "minutes":
+        return f"{seconds / 60:.2f}"
+    if unit == "hours":
+        return f"{seconds / 3600:.2f}"
+    if unit == "days":
+        return f"{seconds / 86400:.2f}"
+    raise ValueError("unit must be one of: seconds, minutes, hours, days")
 
 
 def ensure_issuetype_in_jql(jql: str, issue_type: str) -> str:
-    """
-    If JQL already contains issuetype/type, leave it.
-    Otherwise, inject: AND issuetype = "<issue_type>" (preserving ORDER BY).
-    """
     if re.search(r"\b(issuetype|type)\b", jql, flags=re.IGNORECASE):
         return jql
 
@@ -56,26 +67,41 @@ def ensure_issuetype_in_jql(jql: str, issue_type: str) -> str:
 
 
 def ensure_since_in_jql(jql: str, since_days: int, since_field: str) -> str:
-    """
-    Adds a time window if not already present.
-    Example injection: AND updated >= -365d
-    """
     if since_days <= 0:
         return jql
 
-    # If user already included updated/created constraints, don't add another.
-    if re.search(r"\b(updated|created)\b\s*(>=|>|=|<=|<)", jql, flags=re.IGNORECASE):
+    if re.search(rf"\b{since_field}\b\s*(>=|>|=|<=|<)", jql, flags=re.IGNORECASE):
         return jql
 
-    clause = f'{since_field} >= -{since_days}d'
+    clause = f"{since_field} >= -{since_days}d"
 
     m = re.search(r"\border\s+by\b", jql, flags=re.IGNORECASE)
     if m:
         left = jql[:m.start()].strip()
         right = jql[m.start():].strip()
-        return f'({left}) AND {clause} {right}'
+        return f"({left}) AND {clause} {right}"
 
-    return f'({jql.strip()}) AND {clause}'
+    return f"({jql.strip()}) AND {clause}"
+
+
+# -----------------------------
+# Keychain
+# -----------------------------
+def keychain_get(service: str, account: str = None) -> str:
+    if account is None:
+        account = os.getenv("USER", "")
+
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-a", account, "-s", service, "-w"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        msg = (e.stderr or e.stdout or "").strip()
+        raise RuntimeError(f"Could not read '{service}' from Keychain. {msg}")
 
 
 # -----------------------------
@@ -84,8 +110,9 @@ def ensure_since_in_jql(jql: str, since_days: int, since_field: str) -> str:
 def create_session(email: str, token: str) -> requests.Session:
     if not email or not token:
         raise RuntimeError("Missing auth. Set JIRA_EMAIL and JIRA_API_TOKEN (or pass via CLI).")
+
     s = requests.Session()
-    s.auth = (email, token)  # Jira Cloud: email + API token (Basic)
+    s.auth = (email, token)
     s.headers.update({"Accept": "application/json"})
     return s
 
@@ -105,13 +132,11 @@ def jira_get(
     for attempt in range(max_retries + 1):
         r = session.get(url, params=params, timeout=45)
 
-        # Handle rate limiting
         if r.status_code == 429:
             retry_after = r.headers.get("Retry-After")
             if retry_after:
                 sleep_s = float(retry_after)
             else:
-                # exponential backoff with jitter
                 sleep_s = base_sleep * (2 ** attempt) + random.uniform(0, 0.5)
 
             if attempt >= max_retries:
@@ -123,10 +148,9 @@ def jira_get(
                 )
 
             print(f"[429] Rate limited. Sleeping {sleep_s:.2f}s then retrying... (attempt {attempt+1}/{max_retries})")
-            tm.sleep(sleep_s)  # <-- FIX #1
+            tm.sleep(sleep_s)
             continue
 
-        # Other errors
         if r.status_code >= 400:
             raise RuntimeError(
                 f"Jira request failed\n"
@@ -141,7 +165,7 @@ def jira_get(
 
 
 # -----------------------------
-# Search: GET /search/jql (nextPageToken)
+# Search
 # -----------------------------
 def search_issues(
     session: requests.Session,
@@ -182,9 +206,14 @@ def search_issues(
 
 
 # -----------------------------
-# Changelog: GET /issue/{key}/changelog (startAt paging)
+# Changelog
 # -----------------------------
-def fetch_full_changelog(session: requests.Session, base_url: str, issue_key: str, page_size: int = 100) -> List[Dict[str, Any]]:
+def fetch_full_changelog(
+    session: requests.Session,
+    base_url: str,
+    issue_key: str,
+    page_size: int = 100
+) -> List[Dict[str, Any]]:
     all_values: List[Dict[str, Any]] = []
     start_at = 0
 
@@ -214,30 +243,68 @@ def fetch_full_changelog(session: requests.Session, base_url: str, issue_key: st
     return all_values
 
 
-def extract_phase_events(
-    issue_key: str,
-    changelog_values: List[Dict[str, Any]],
-    field_name: str,
-    field_id: str = "",
-) -> List[Tuple[str, str]]:
-    events: List[Tuple[str, str]] = []
-
-    def matches(item: Dict[str, Any]) -> bool:
-        if field_id:
-            return item.get("fieldId") == field_id
-        return item.get("field") == field_name
+def extract_status_transitions(changelog_values: List[Dict[str, Any]]) -> List[Tuple[str, str, datetime]]:
+    """
+    Returns a list of: (from_status, to_status, changed_at)
+    """
+    transitions: List[Tuple[str, str, datetime]] = []
 
     sorted_hist = sorted(changelog_values, key=lambda h: h.get("created") or "")
 
     for h in sorted_hist:
-        created = h.get("created", "")
-        created_iso = iso_from_jira_dt(created)
-        for it in (h.get("items") or []):
-            if matches(it):
-                to_val = (it.get("toString") or "").strip() or "EMPTY"
-                events.append((to_val, created_iso))
+        created_raw = h.get("created", "")
+        created_dt = parse_jira_dt(created_raw)
+        if not created_dt:
+            continue
 
-    return events
+        for it in (h.get("items") or []):
+            if it.get("field") == "status":
+                from_status = (it.get("fromString") or "").strip()
+                to_status = (it.get("toString") or "").strip()
+                transitions.append((from_status, to_status, created_dt))
+
+    return transitions
+
+
+def calculate_time_in_status(
+    issue_created: str,
+    current_status: str,
+    changelog_values: List[Dict[str, Any]],
+    now_dt: datetime,
+) -> Dict[str, float]:
+ 
+    durations: Dict[str, float] = {}
+
+    created_dt = parse_jira_dt(issue_created)
+    if not created_dt:
+        return durations
+
+    transitions = extract_status_transitions(changelog_values)
+
+    # No status changes: everything from creation until now belongs to current status
+    if not transitions:
+        seconds = max((now_dt - created_dt).total_seconds(), 0.0)
+        durations[current_status] = durations.get(current_status, 0.0) + seconds
+        return durations
+
+    # Initial status is the "from" of the first status transition if present,
+    # otherwise fall back to current status.
+    first_from = transitions[0][0].strip() if transitions[0][0] else current_status
+    prev_status = first_from
+    prev_time = created_dt
+
+    for from_status, to_status, changed_at in transitions:
+        seconds = max((changed_at - prev_time).total_seconds(), 0.0)
+        durations[prev_status] = durations.get(prev_status, 0.0) + seconds
+
+        prev_status = to_status or prev_status
+        prev_time = changed_at
+
+    # Final open interval: last transitioned status -> now
+    seconds = max((now_dt - prev_time).total_seconds(), 0.0)
+    durations[prev_status] = durations.get(prev_status, 0.0) + seconds
+
+    return durations
 
 
 # -----------------------------
@@ -245,19 +312,20 @@ def extract_phase_events(
 # -----------------------------
 def build_matrix(
     issues: List[Dict[str, Any]],
-    per_issue_events: Dict[str, List[Tuple[str, str]]],
-    mode: str,
+    per_issue_durations: Dict[str, Dict[str, float]],
+    unit: str,
 ) -> Tuple[List[str], List[List[str]]]:
-    values_set = set()
-    for events in per_issue_events.values():
-        for val, _ts in events:
-            values_set.add(val)
+    statuses_set = set()
+
+    for duration_map in per_issue_durations.values():
+        statuses_set.update(duration_map.keys())
 
     def natural_key(s: str):
         return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s or "")]
-    all_values_order = sorted(values_set, key=natural_key)
 
-    headers = ["issue_key", "summary", "assignee"] + all_values_order
+    all_statuses = sorted(statuses_set, key=natural_key)
+
+    headers = ["issue_key", "summary", "assignee"] + all_statuses
     rows: List[List[str]] = []
 
     for issue in issues:
@@ -267,23 +335,13 @@ def build_matrix(
 
         assignee_obj = fields.get("assignee")
         assignee = ""
-
         if isinstance(assignee_obj, dict):
             assignee = (assignee_obj.get("displayName") or assignee_obj.get("emailAddress") or "").strip()
 
-
-        cell_map: Dict[str, str] = {}
-
-        for val, ts in per_issue_events.get(key, []):
-            if mode == "first":
-                cell_map.setdefault(val, ts)
-            elif mode == "last":
-                cell_map[val] = ts
-            else:
-                raise ValueError("mode must be 'first' or 'last'")
-
-        row = [key, summary, assignee] + [cell_map.get(v, "") for v in all_values_order]
-
+        duration_map = per_issue_durations.get(key, {})
+        row = [key, summary, assignee] + [
+            format_duration(duration_map.get(status, 0.0), unit) for status in all_statuses
+        ]
         rows.append(row)
 
     return headers, rows
@@ -294,7 +352,7 @@ def build_matrix(
 # -----------------------------
 def main() -> int:
     p = argparse.ArgumentParser(
-            description="Build a CSV matrix of change timestamps for a Jira field per issue using /search/jql + /issue/{key}/changelog."
+        description="Build a CSV matrix of total time spent in each Jira status per issue."
     )
 
     p.add_argument("--base-url", default=DEFAULT_BASE_URL)
@@ -309,28 +367,19 @@ def main() -> int:
     p.add_argument("--since-field", choices=["updated", "created"], default="updated")
     p.add_argument("--sleep-ms", type=int, default=150)
 
-    p.add_argument("--field-name", required=False, default=None,
-               help='Display name of the field to track (e.g. "PI - PxTA Phase")')
-    p.add_argument("--field-id", required=False, default=None,
-               help='Field id to track (e.g. "customfield_12345") - preferred if known')
-
-
-    p.add_argument("--out", default="phase_matrix.csv")
+    p.add_argument("--out", default="status_time_matrix.csv")
     p.add_argument("--search-page-size", type=int, default=100)
     p.add_argument("--changelog-page-size", type=int, default=100)
-    p.add_argument("--mode", choices=["first", "last"], default="first")
+    p.add_argument("--time-unit", choices=["seconds", "minutes", "hours", "days"], default="hours")
 
     args = p.parse_args()
-    if not args.field_name and not args.field_id:
-        raise SystemExit('ERROR: You must provide either --field-name or --field-id')
-    # Pull creds from Keychain if not passed via CLI/env
+
     if not args.base_url:
-     args.base_url = keychain_get("jira_base_url")
+        args.base_url = keychain_get("jira_base_url")
     if not args.email:
         args.email = keychain_get("jira_email")
     if not args.token:
         args.token = keychain_get("jira_api_token")
-
 
     session = create_session(args.email, args.token)
 
@@ -347,7 +396,7 @@ def main() -> int:
         session=session,
         base_url=args.base_url,
         jql=full_jql,
-        fields=["summary", "assignee"],
+        fields=["summary", "assignee", "created", "status"],
         max_results=args.search_page_size,
         limit=limit,
     )
@@ -356,14 +405,16 @@ def main() -> int:
         print("No issues found for JQL:", full_jql)
         return 0
 
-    per_issue_events: Dict[str, List[Tuple[str, str]]] = {}
+    now_dt = datetime.now(timezone.utc)
+    per_issue_durations: Dict[str, Dict[str, float]] = {}
+
     for i, issue in enumerate(issues, start=1):
         key = issue.get("key")
         if not key:
             continue
 
         if args.sleep_ms > 0:
-            tm.sleep(args.sleep_ms / 1000.0)  # <-- FIX #1
+            tm.sleep(args.sleep_ms / 1000.0)
 
         changelog_values = fetch_full_changelog(
             session=session,
@@ -372,18 +423,26 @@ def main() -> int:
             page_size=args.changelog_page_size,
         )
 
-        events = extract_phase_events(
-            issue_key=key,
+        fields = issue.get("fields") or {}
+        issue_created = fields.get("created", "")
+        status_obj = fields.get("status") or {}
+        current_status = (status_obj.get("name") or "").strip()
+
+        per_issue_durations[key] = calculate_time_in_status(
+            issue_created=issue_created,
+            current_status=current_status,
             changelog_values=changelog_values,
-            field_name=args.field_name or "",
-            field_id=args.field_id or "",
+            now_dt=now_dt,
         )
-        per_issue_events[key] = events
 
         if i % 25 == 0:
             print(f"Processed {i}/{len(issues)} issues...")
 
-    headers, rows = build_matrix(issues, per_issue_events, mode=args.mode)
+    headers, rows = build_matrix(
+        issues=issues,
+        per_issue_durations=per_issue_durations,
+        unit=args.time_unit,
+    )
 
     with open(args.out, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -392,31 +451,8 @@ def main() -> int:
 
     print(f"Done. Wrote {len(rows)} rows to {args.out}")
     print(f"JQL used: {full_jql}")
-    print(f"Field: {args.field_id or args.field_name} | mode={args.mode}")
+    print(f"Time unit: {args.time_unit}")
     return 0
-import subprocess
-
-def keychain_get(service: str, account: str = None) -> str:
-    """
-    Reads a generic password from macOS Keychain.
-    service: the -s value you stored (e.g., jira_api_token)
-    account: optional -a value (defaults to current user via $USER)
-    """
-    if account is None:
-        account = os.getenv("USER", "")
-
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-a", account, "-s", service, "-w"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        msg = (e.stderr or e.stdout or "").strip()
-        raise RuntimeError(f"Could not read '{service}' from Keychain. {msg}")
-
 
 
 if __name__ == "__main__":
